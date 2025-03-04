@@ -166,12 +166,12 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
   }
 
   connectedCallback() {
-    this.addEventListener('file-ready', this.handleUpload);
+    this.addEventListener('file-ready', this.handleFiles);
     this.addEventListener('reset', this.resetState);
   }
 
   disconnectedCallback() {
-    this.removeEventListener('file-ready', this.handleUpload, false);
+    this.removeEventListener('file-ready', this.handleFiles, false);
     this.removeEventListener('reset', this.resetState);
   }
 
@@ -385,17 +385,7 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
     this._uploads.clear();
   }
 
-  handleUpload(evt: CustomEvent) {
-    const endpoint = this.endpoint;
-
-    if (!endpoint) {
-      this.setError(`No url or endpoint specified -- cannot handleUpload`);
-      // Bail early if no endpoint.
-      return;
-    } else {
-      this.removeAttribute('upload-error');
-    }
-
+  handleFiles(evt: CustomEvent) {
     if (this.multiple && Array.isArray(evt.detail)) {
       // Handle multiple files:
       // 1. Add all files to the upload queue
@@ -444,6 +434,14 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
     const endpoint = this.endpoint;
     const dynamicChunkSize = this.dynamicChunkSize;
 
+    if (!endpoint) {
+      this.setError(`No url or endpoint specified -- cannot startUpload`);
+      // Bail early if no endpoint.
+      return;
+    } else {
+      this.removeAttribute('upload-error');
+    }
+
     try {
       const upload = UpChunk.createUpload({
         endpoint,
@@ -454,7 +452,6 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
         useLargeFileWorkaround: this.useLargeFileWorkaround,
       });
 
-      // Store in both places for backwards compatibility
       if (!this.multiple) {
         this._upload = upload;
       }
@@ -500,6 +497,7 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
           })
         );
 
+        // todo should we gate this on multiple?
         this.completeUpload(fileId);
       });
 

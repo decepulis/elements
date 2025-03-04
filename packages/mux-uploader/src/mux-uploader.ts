@@ -34,6 +34,7 @@ type ErrorDetail = {
   message: string;
   chunkNumber?: number;
   attempts?: number;
+  file?: File;
 };
 
 // NOTE: Progress event is already determined on HTMLElement but have inconsistent types. Should consider renaming events (CJP)
@@ -42,6 +43,7 @@ export interface MuxUploaderElementEventMap extends Omit<HTMLElementEventMap, 'p
   chunkattempt: CustomEvent<{
     chunkNumber: number;
     chunkSize: number;
+    file?: File;
   }>;
   chunksuccess: CustomEvent<{
     chunk: number;
@@ -50,11 +52,14 @@ export interface MuxUploaderElementEventMap extends Omit<HTMLElementEventMap, 'p
     timeInterval: number;
     // Note: This should be more explicitly typed in Upchunk. (TD).
     response: any;
+    file?: File;
   }>;
   uploaderror: CustomEvent<ErrorDetail>;
-  progress: CustomEvent<number>;
-  success: CustomEvent<undefined | null>;
-  'file-ready': CustomEvent<File>;
+  progress: CustomEvent<number | { progress: number; file: File }>;
+  success: CustomEvent<undefined | null | { file: File }>;
+  'file-ready': CustomEvent<File | File[]>;
+  'queue-started': CustomEvent<{ files: File[] }>;
+  'queue-complete': CustomEvent<undefined | null>;
 }
 
 interface MuxUploaderElement extends HTMLElement {
@@ -91,11 +96,30 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
       'no-retry',
       'max-file-size',
       'use-large-file-workaround',
+      'multiple',
+      'max-concurrent-uploads',
     ];
   }
 
   protected _endpoint: Endpoint;
-  protected _upload?: UpChunk;
+  protected _upload?: UpChunk; // For backward compatibility with single file uploads
+
+  /**
+   * A Map tracking all currently active upload instances.
+   * Key: A unique file identifier
+   * Value: The UpChunk instance managing the upload
+   *
+   * The number of entries (this._uploads.size) represents how many uploads
+   * are currently in progress.
+   */
+  protected _uploads: Map<string, UpChunk> = new Map();
+
+  /**
+   * A queue of files waiting to be uploaded.
+   * Files are processed from this queue as upload slots become available,
+   * based on the maxConcurrentUploads limit.
+   */
+  protected _uploadQueue: File[] = [];
 
   constructor() {
     super();
@@ -108,11 +132,28 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
     // Attach a layout
     this.updateLayout();
 
-    this.hiddenFileInput?.addEventListener('change', () => {
-      const file = this.hiddenFileInput?.files?.[0];
-      this.toggleAttribute('file-ready', !!file);
+    // Synchronize the hiddenFileInput's multiple attribute with the component's multiple attribute
+    if (this.hiddenFileInput) {
+      this.hiddenFileInput.multiple = this.multiple;
+    }
 
-      if (file) {
+    this.hiddenFileInput?.addEventListener('change', () => {
+      const files = this.hiddenFileInput?.files;
+      if (!files || files.length === 0) return;
+
+      this.toggleAttribute('file-ready', true);
+
+      if (this.multiple) {
+        const fileArray = Array.from(files);
+        this.dispatchEvent(
+          new CustomEvent('file-ready', {
+            composed: true,
+            bubbles: true,
+            detail: fileArray,
+          })
+        );
+      } else {
+        const file = files[0];
         this.dispatchEvent(
           new CustomEvent('file-ready', {
             composed: true,
@@ -261,22 +302,61 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
     return this._upload;
   }
 
+  get multiple(): boolean {
+    return this.hasAttribute('multiple');
+  }
+
+  set multiple(value: boolean) {
+    this.toggleAttribute('multiple', Boolean(value));
+    if (this.hiddenFileInput) {
+      this.hiddenFileInput.multiple = Boolean(value);
+    }
+  }
+
+  get maxConcurrentUploads(): number {
+    return parseInt(this.getAttribute('max-concurrent-uploads') || '3', 10);
+  }
+
+  set maxConcurrentUploads(value: number) {
+    this.setAttribute('max-concurrent-uploads', value.toString());
+  }
+
   get paused() {
+    if (this.multiple) {
+      // Return true only if all active uploads are paused
+      if (this._uploads.size === 0) return false;
+      for (const upload of this._uploads.values()) {
+        if (!upload.paused) return false;
+      }
+      return true;
+    }
     return this.upload?.paused ?? false;
   }
 
   set paused(value) {
-    if (!this.upload) {
-      console.warn('Pausing before an upload has begun is unsupported');
-      return;
-    }
     const boolVal = !!value;
-    if (boolVal === this.paused) return;
-    if (boolVal) {
-      this.upload.pause();
+
+    if (this.multiple) {
+      for (const upload of this._uploads.values()) {
+        if (boolVal && !upload.paused) {
+          upload.pause();
+        } else if (!boolVal && upload.paused) {
+          upload.resume();
+        }
+      }
     } else {
-      this.upload.resume();
+      if (!this.upload) {
+        console.warn('Pausing before an upload has begun is unsupported');
+        return;
+      }
+      if (boolVal === this.paused) return;
+      if (boolVal) {
+        this.upload.pause();
+      } else {
+        this.upload.resume();
+      }
     }
+
     this.toggleAttribute('paused', boolVal);
     this.dispatchEvent(new CustomEvent('pausedchange', { detail: boolVal }));
   }
@@ -301,11 +381,12 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
     this.removeAttribute('upload-complete');
     // Reset file to ensure change/input events will fire, even if selecting the same file (CJP).
     this.hiddenFileInput.value = '';
+    this._uploadQueue = [];
+    this._uploads.clear();
   }
 
   handleUpload(evt: CustomEvent) {
     const endpoint = this.endpoint;
-    const dynamicChunkSize = this.dynamicChunkSize;
 
     if (!endpoint) {
       this.setError(`No url or endpoint specified -- cannot handleUpload`);
@@ -315,17 +396,72 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
       this.removeAttribute('upload-error');
     }
 
+    if (this.multiple && Array.isArray(evt.detail)) {
+      // Handle multiple files:
+      // 1. Add all files to the upload queue
+      // 2. Start uploading up to maxConcurrentUploads files
+      this._uploadQueue = [...evt.detail];
+      this.setAttribute('upload-in-progress', '');
+
+      this.dispatchEvent(
+        new CustomEvent('queue-started', {
+          detail: { files: [...this._uploadQueue] },
+        })
+      );
+
+      this.processQueue();
+    } else {
+      // Handle single file upload
+      this.startUpload(evt.detail);
+    }
+  }
+
+  /**
+   * Process available files from the queue, starting uploads
+   * until we reach the maxConcurrentUploads limit.
+   */
+  processQueue() {
+    // Start uploads until we reach the concurrent upload limit or the queue is empty
+    while (this._uploads.size < this.maxConcurrentUploads && this._uploadQueue.length > 0) {
+      const file = this._uploadQueue.shift();
+      if (file) {
+        this.startUpload(file);
+      }
+    }
+  }
+
+  /**
+   * Start uploading a single file.
+   *
+   * This method:
+   * 1. Creates an UpChunk instance for the file
+   * 2. Adds it to the _uploads Map
+   * 3. Sets up event handlers for the upload process
+   *
+   * @param file The file to upload
+   */
+  startUpload(file: File) {
+    const endpoint = this.endpoint;
+    const dynamicChunkSize = this.dynamicChunkSize;
+
     try {
       const upload = UpChunk.createUpload({
         endpoint,
         dynamicChunkSize,
-        file: evt.detail,
+        file,
         maxFileSize: this.maxFileSize,
         chunkSize: this.chunkSize,
         useLargeFileWorkaround: this.useLargeFileWorkaround,
       });
 
-      this._upload = upload;
+      // Store in both places for backwards compatibility
+      if (!this.multiple) {
+        this._upload = upload;
+      }
+
+      // Create a unique identifier for this file upload
+      const fileId = this.getUniqueFileId(file);
+      this._uploads.set(fileId, upload);
 
       this.dispatchEvent(
         new CustomEvent('uploadstart', { detail: { file: upload.file, chunkSize: upload.chunkSize } })
@@ -337,33 +473,70 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
       }
 
       upload.on('attempt', (event: any) => {
-        this.dispatchEvent(new CustomEvent('chunkattempt', event));
+        this.dispatchEvent(
+          new CustomEvent('chunkattempt', {
+            ...event,
+            detail: { ...event.detail, file },
+          })
+        );
       });
 
       upload.on('chunkSuccess', (event: any) => {
-        this.dispatchEvent(new CustomEvent('chunksuccess', event));
+        this.dispatchEvent(
+          new CustomEvent('chunksuccess', {
+            ...event,
+            detail: { ...event.detail, file },
+          })
+        );
       });
 
       upload.on('error', (event: any) => {
         this.setAttribute('upload-error', '');
         console.error('error handler', event.detail.message);
-        this.dispatchEvent(new CustomEvent('uploaderror', event));
+        this.dispatchEvent(
+          new CustomEvent('uploaderror', {
+            ...event,
+            detail: { ...event.detail, file },
+          })
+        );
+
+        this.completeUpload(fileId);
       });
 
       upload.on('progress', (event: any) => {
-        this.dispatchEvent(new CustomEvent('progress', event));
+        if (this.multiple) {
+          this.dispatchEvent(
+            new CustomEvent('progress', {
+              ...event,
+              detail: { progress: event.detail, file },
+            })
+          );
+        } else {
+          this.dispatchEvent(new CustomEvent('progress', event));
+        }
       });
 
       upload.on('success', (event: any) => {
-        this.removeAttribute('upload-in-progress');
-        this.setAttribute('upload-complete', '');
+        if (this.multiple) {
+          this.dispatchEvent(
+            new CustomEvent('success', {
+              ...event,
+              detail: { ...event.detail, file },
+            })
+          );
+        } else {
+          this.removeAttribute('upload-in-progress');
+          this.setAttribute('upload-complete', '');
+          this.dispatchEvent(new CustomEvent('success', event));
+        }
 
-        this.dispatchEvent(new CustomEvent('success', event));
+        this.completeUpload(fileId);
       });
 
       upload.on('offline', (event: any) => {
         this.dispatchEvent(new CustomEvent('offline', event));
       });
+
       upload.on('online', (event: any) => {
         this.dispatchEvent(new CustomEvent('online', event));
       });
@@ -372,6 +545,55 @@ class MuxUploaderElement extends globalThis.HTMLElement implements MuxUploaderEl
         this.setError(err.message);
       }
     }
+  }
+
+  /**
+   * Handle completion of an upload (success or error).
+   *
+   * This method:
+   * 1. Removes the completed upload from the _uploads Map
+   * 2. Processes the next item in the queue if available
+   * 3. Fires appropriate events if all uploads are complete
+   *
+   * @param fileId The unique identifier of the completed upload
+   */
+  completeUpload(fileId: string) {
+    this._uploads.delete(fileId);
+
+    // Process next item in queue if any
+    if (this._uploadQueue.length > 0) {
+      this.processQueue();
+    } else if (this._uploads.size === 0) {
+      // All uploads are complete
+      if (this.multiple) {
+        this.removeAttribute('upload-in-progress');
+        this.setAttribute('upload-complete', '');
+        this.dispatchEvent(new CustomEvent('queue-complete'));
+      }
+    }
+  }
+
+  /**
+   * Generate a unique identifier for a file upload
+   * @param file The file to create an ID for
+   * @returns A string identifier
+   */
+  protected getUniqueFileId(file: File): string {
+    return `${file.name}-${file.size}-${Date.now()}`;
+  }
+
+  /**
+   * Get the number of currently active uploads
+   */
+  get activeUploadsCount(): number {
+    return this._uploads.size;
+  }
+
+  /**
+   * Get the number of files waiting in the queue
+   */
+  get queuedFilesCount(): number {
+    return this._uploadQueue.length;
   }
 }
 
